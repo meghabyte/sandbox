@@ -1,4 +1,6 @@
 import re
+import json
+import difflib
 import argparse
 from typing import Optional, List, Tuple
 
@@ -414,7 +416,8 @@ def whitebox_attack(
     ppl_factor:    float = 2.0,
     max_iters:     int   = 20,
     top_k:         int   = 20,   # top-k vocab candidates per token position
-) -> str:
+    return_history: bool = False,
+):
     _init_reward_model()
     _init_embedder()
     _init_gpt2()
@@ -455,6 +458,7 @@ def whitebox_attack(
 
     current_text = start_text
     current_r    = base_r
+    swap_history = []   # list of {"step", "from", "to", "log_odds"}
 
     for step in range(max_iters):
         r, grad, cur_full_ids = reward(current_text, with_grad=True)
@@ -531,13 +535,213 @@ def whitebox_attack(
         _print_step(step + 1, current_text, current_r, s,
                     orig_ppl, trial_ppl, f"'{orig_tok_str}' \u2192 '{new_tok_str}'"
         )
+        swap_history.append({
+            "step": step + 1,
+            "from": orig_tok_str,
+            "to": new_tok_str,
+            "log_odds": round(current_r, 4),
+        })
 
         flipped_now = current_r > 0 if flip_to_yes else current_r < 0
         target_label = "YES" if flip_to_yes else "NO"
         if flipped_now:
             print(f"\n✓ Vote flipped to {target_label} at step {step + 1}!")
             break
+
+    if return_history:
+        return current_text, swap_history
     return current_text
+
+
+def sentence_diffs(orig: str, final: str) -> list:
+    """
+    Return [{original, modified}] for every sentence that changed.
+    Splits on sentence-ending punctuation within each line; blank lines
+    (section headers, paragraph breaks) are kept as single units.
+    """
+    def split_sents(text):
+        out = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            for sent in re.split(r'(?<=[.!?])\s+', line):
+                s = sent.strip()
+                if s:
+                    out.append(s)
+        return out
+
+    orig_s  = split_sents(orig)
+    final_s = split_sents(final)
+    diffs   = []
+    matcher = difflib.SequenceMatcher(None, orig_s, final_s, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        diffs.append({
+            "original": " ".join(orig_s[i1:i2]),
+            "modified": " ".join(final_s[j1:j2]),
+        })
+    return diffs
+
+
+def _split_paragraphs(text: str) -> list:
+    """Split `text` into paragraphs (blocks separated by blank lines).
+    Each `=== HEADER ===` line is treated as its own paragraph so section
+    structure stays aligned between the original and modified texts."""
+    paras, cur = [], []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if cur:
+                paras.append(" ".join(cur))
+                cur = []
+            continue
+        if stripped.startswith("===") and stripped.endswith("==="):
+            if cur:
+                paras.append(" ".join(cur))
+                cur = []
+            paras.append(stripped)
+            continue
+        cur.append(stripped)
+    if cur:
+        paras.append(" ".join(cur))
+    return paras
+
+
+def _inline_word_diff(orig: str, mod: str) -> str:
+    """Word-level diff of two strings rendered inline with change-tracking
+    markup: unchanged words stay plain, removed words are ~~struck through~~
+    and inserted words are **bolded**. This keeps every edit visible in its
+    full paragraph context so semantic drift is easy to judge."""
+    orig_w = orig.split()
+    mod_w  = mod.split()
+    sm  = difflib.SequenceMatcher(None, orig_w, mod_w, autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.append(" ".join(orig_w[i1:i2]))
+        elif tag == "replace":
+            out.append("~~" + " ".join(orig_w[i1:i2]) + "~~ **"
+                       + " ".join(mod_w[j1:j2]) + "**")
+        elif tag == "delete":
+            out.append("~~" + " ".join(orig_w[i1:i2]) + "~~")
+        elif tag == "insert":
+            out.append("**" + " ".join(mod_w[j1:j2]) + "**")
+    return " ".join(out)
+
+
+def paragraph_diffs(orig: str, final: str) -> list:
+    """Return [{section, original, modified, inline_diff, word_changes}] for
+    every paragraph that changed. Full paragraph context is preserved so it is
+    clear whether a word swap distorts the surrounding meaning, and each edit is
+    highlighted inline via `inline_diff`."""
+    orig_p  = _split_paragraphs(orig)
+    final_p = _split_paragraphs(final)
+
+    # Nearest preceding `=== HEADER ===` for each original paragraph.
+    sections, cur_section = [], ""
+    for p in orig_p:
+        if p.startswith("===") and p.endswith("==="):
+            cur_section = p.strip("= ").strip()
+        sections.append(cur_section)
+
+    diffs   = []
+    matcher = difflib.SequenceMatcher(None, orig_p, final_p, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        orig_block = "\n\n".join(orig_p[i1:i2])
+        mod_block  = "\n\n".join(final_p[j1:j2])
+
+        # Collect the individual word substitutions inside this paragraph.
+        word_changes = []
+        sm = difflib.SequenceMatcher(None, orig_block.split(),
+                                     mod_block.split(), autojunk=False)
+        for t, a1, a2, b1, b2 in sm.get_opcodes():
+            if t == "equal":
+                continue
+            word_changes.append({
+                "from": " ".join(orig_block.split()[a1:a2]),
+                "to":   " ".join(mod_block.split()[b1:b2]),
+            })
+
+        diffs.append({
+            "section":      sections[i1] if i1 < len(sections) else "",
+            "original":     orig_block,
+            "modified":     mod_block,
+            "inline_diff":  _inline_word_diff(orig_block, mod_block),
+            "word_changes": word_changes,
+        })
+    return diffs
+
+
+def write_markdown_report(proposition: str, results: list, path: str,
+                          settings: dict):
+    """Write a human-readable markdown report with paragraph-level, inline
+    change-tracked diffs for each voter — easier to eyeball than the JSON."""
+    lines = []
+    lines.append("# RL Attack — Paragraph-Level Diffs vs Original Proposition")
+    lines.append("")
+    lines.append(f"**Model:** Qwen2.5-7B-Instruct  ")
+    lines.append(f"**Attack:** whitebox token-swap  ")
+    lines.append(f"**Settings:** sim_threshold={settings['sim_threshold']}, "
+                 f"ppl_factor={settings['ppl_factor']}, "
+                 f"max_iters={settings['max_iters']}  ")
+    lines.append(f"**Voters:** {len(results)}")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Voter | Base log-odds | Final log-odds | Flipped? | Swaps |")
+    lines.append("|-------|:---:|:---:|:---:|:---:|")
+    for r in results:
+        flip = "✓" if r["flipped"] else "✗"
+        lines.append(f"| {r['voter_row']} | {r['base_log_odds']:+.3f} | "
+                     f"{r['final_log_odds']:+.3f} | {flip} | {r['n_swaps']} |")
+    n_flipped = sum(r["flipped"] for r in results)
+    lines.append("")
+    lines.append(f"**Flip rate: {n_flipped}/{len(results)} "
+                 f"({n_flipped / max(len(results),1):.0%})**")
+    lines.append("")
+    lines.append("---")
+
+    for r in results:
+        lines.append("")
+        lines.append(f"## Voter {r['voter_row']} — "
+                     f"{'flipped' if r['flipped'] else 'NOT flipped'}")
+        lines.append(f"**Base log-odds:** {r['base_log_odds']:+.3f} → "
+                     f"**Final:** {r['final_log_odds']:+.3f}  "
+                     f"({r['n_swaps']} swaps)")
+        lines.append("")
+
+        if r["swaps"]:
+            lines.append("| Step | From | To | After log-odds |")
+            lines.append("|------|------|----|---:|")
+            for s in r["swaps"]:
+                lines.append(f"| {s['step']} | `{s['from']}` | `{s['to']}` | "
+                             f"{s['log_odds']:+.3f} |")
+            lines.append("")
+
+        pdiffs = r.get("paragraph_diffs", [])
+        if not pdiffs:
+            lines.append("*No paragraph-level changes.*")
+            continue
+
+        lines.append("**Changed paragraphs** "
+                     "(~~removed~~ / **inserted**):")
+        lines.append("")
+        for d in pdiffs:
+            if d["section"]:
+                lines.append(f"### {d['section']}")
+            lines.append("")
+            lines.append("> " + d["inline_diff"].replace("\n\n", "\n>\n> "))
+            lines.append("")
+        lines.append("---")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
 
 
 def parse_args():
@@ -588,6 +792,9 @@ def main():
     with open("prop_minwage_full.txt") as f:
         proposition = f.read().strip()
 
+    results = []
+    results_path = "rl_results.json"
+
     global VOTER_PROFILE
     for row_idx, row in df.iterrows():
         if row_idx >= 10:   # remove this to run all voters
@@ -599,17 +806,53 @@ def main():
               f"  |  ppl_factor={args.ppl_factor}  |  max_iters={args.max_iters}")
         print(f"{'═'*70}")
 
-        final = whitebox_attack(
+        base_r = reward(proposition)[0]
+
+        final, swap_history = whitebox_attack(
             proposition,
             sim_threshold=args.sim_threshold,
             ppl_factor=args.ppl_factor,
             max_iters=args.max_iters,
+            return_history=True,
         )
+
+        final_r = reward(final)[0]
+        flipped = (base_r < 0 and final_r > 0) or (base_r > 0 and final_r < 0)
 
         print(f"\n{'═'*70}")
         print(f"FINAL TEXT — Voter {row_idx}")
         print(f"{'═'*70}")
         print(final)
+
+        results.append({
+            "voter_row":       int(row_idx),
+            "base_log_odds":   round(base_r, 4),
+            "final_log_odds":  round(final_r, 4),
+            "flipped":         flipped,
+            "n_swaps":         len(swap_history),
+            "swaps":           swap_history,   # [{"step","from","to","log_odds"}, ...]
+            "sentence_diffs":  sentence_diffs(proposition, final),
+            "paragraph_diffs": paragraph_diffs(proposition, final),
+            "final_text":      final,
+        })
+
+        with open(results_path, "w") as f:
+            json.dump({"proposition": proposition, "results": results}, f, indent=2)
+
+    settings = {
+        "sim_threshold": args.sim_threshold,
+        "ppl_factor":    args.ppl_factor,
+        "max_iters":     args.max_iters,
+    }
+    md_path = "rl_results.md"
+    write_markdown_report(proposition, results, md_path, settings)
+
+    n_flipped = sum(r["flipped"] for r in results)
+    print(f"\n=== DONE ===")
+    print(f"  Voters:  {len(results)}")
+    print(f"  Flipped: {n_flipped}/{len(results)}")
+    print(f"  Saved word- + paragraph-level diffs + final texts → {results_path}")
+    print(f"  Saved readable paragraph diff report → {md_path}")
 
 
 if __name__ == "__main__":
