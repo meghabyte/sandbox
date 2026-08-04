@@ -112,6 +112,107 @@ def reward(text: str, with_grad: bool = False):
     return log_odds.item(), embeddings.grad[0].detach(), ids
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Generation + LLM-judge utilities (reuse the loaded Qwen model — no extra VRAM)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _generate(messages: List[dict], max_new_tokens: int = 512,
+              temperature: float = 1.0, do_sample: bool = True,
+              n: int = 1) -> List[str]:
+    """Generate `n` completions for a chat `messages` list with the Qwen model.
+    Returns a list of `n` decoded strings (the newly generated text only)."""
+    _init_reward_model()
+    prompt = _qwen_tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    ids = _qwen_tok(prompt, return_tensors="pt").input_ids.to(DEVICE)
+
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        num_return_sequences=n,
+        pad_token_id=_qwen_tok.eos_token_id,
+    )
+    if do_sample:
+        gen_kwargs.update(do_sample=True, temperature=temperature)
+    else:
+        gen_kwargs.update(do_sample=False)   # greedy — omit temperature to avoid warnings
+
+    with torch.no_grad():
+        out = _qwen_model.generate(ids, **gen_kwargs)
+
+    return [
+        _qwen_tok.decode(seq[ids.shape[1]:], skip_special_tokens=True).strip()
+        for seq in out
+    ]
+
+
+# ── paraphrase: original -> paraphrase ──────────────────────────────────────
+PARAPHRASE_SYSTEM = (
+    "You are an expert paraphraser. You restate text so the wording and sentence "
+    "structure change substantially while the meaning, facts, and stance stay "
+    "exactly the same."
+)
+PARAPHRASE_USER = (
+    "Paraphrase the text below. Preserve every fact, number, name, and the overall "
+    "meaning and stance; only change wording and sentence structure. Return ONLY "
+    "the paraphrased text, with no preamble or surrounding quotation marks.\n\n"
+    "{text}"
+)
+
+
+def paraphrase(text: str, temperature: float = 1.0,
+               max_new_tokens: int = 512) -> str:
+    """original -> paraphrase. One meaning-preserving paraphrase of `text`.
+
+    Call repeatedly with temperature > 0 to sample many distinct paraphrases
+    (e.g. 100× for the robustness test): a ballot rewrite is 'robust' if the
+    voter's YES/NO decision — from reward()/_vote — is unchanged across all of
+    them.
+    """
+    messages = [
+        {"role": "system", "content": PARAPHRASE_SYSTEM},
+        {"role": "user",   "content": PARAPHRASE_USER.format(text=text)},
+    ]
+    return _generate(messages, temperature=temperature,
+                     do_sample=True, max_new_tokens=max_new_tokens, n=1)[0]
+
+
+# ── similarity_check: (original, rewrite) -> YES-vs-NO log-odds ──────────────
+SIMILARITY_SYSTEM = (
+    "You are a meticulous evaluator of semantic equivalence between two texts. "
+    "Answer whether the rewrite preserves the original text's meaning, facts, "
+    "numbers, and stance. A reversal such as 'raise' to 'cut' is not equivalent."
+)
+SIMILARITY_USER = (
+    "Does the REWRITE preserve the meaning, facts, numbers, and stance of the "
+    "ORIGINAL? Respond YES only if it does; otherwise respond NO.\n\n"
+    "=== ORIGINAL ===\n{original}\n\n=== REWRITE ===\n{rewrite}"
+)
+
+
+def similarity_check(original: str, rewrite: str) -> float:
+    """Return YES-vs-NO log-odds for semantic equivalence.
+
+    This performs one model forward pass, not generation. Positive values mean
+    the model leans YES (the rewrite preserves meaning); negative values mean it
+    leans NO. The magnitude represents confidence and is not bounded.
+    """
+    messages = [
+        {"role": "system", "content": SIMILARITY_SYSTEM},
+        {"role": "user",   "content": SIMILARITY_USER.format(
+            original=original, rewrite=rewrite)},
+    ]
+    _init_reward_model()
+    prompt = _qwen_tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    ids = _qwen_tok(prompt, return_tensors="pt").input_ids.to(DEVICE)
+
+    with torch.no_grad():
+        logits = _qwen_model(ids).logits[0, -1].float()
+
+    return (logits[_yes_id] - logits[_no_id]).item()
+
 
 _embedder: Optional[SentenceTransformer] = None
 
