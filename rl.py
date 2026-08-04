@@ -95,6 +95,7 @@ def reward(text: str, with_grad: bool = False):
                            grad : (seq_len, hidden)  d(log_odds)/d(embeddings)
                            ids  : (1, seq_len)
     """
+    _init_reward_model()
     ids = _build_prompt_ids(text)
 
     if not with_grad:
@@ -460,7 +461,22 @@ def _print_step(step: int, text: str, r: float, s: float,
           f"  sim={s:.4f}  ppl={trial_ppl:.1f} ({ppl_str})  ({change})")
     print(text)
 
-def _find_text_token_span(text: str) -> Tuple[int, int, torch.Tensor]:
+def _section_parts(text: str, header: str) -> Tuple[str, str, str]:
+    """Return text before, inside, and after a === SECTION === block."""
+    marker = f"=== {header} ==="
+    marker_start = text.find(marker)
+    if marker_start == -1:
+        raise ValueError(f"Section not found: {marker}")
+    body_start = marker_start + len(marker)
+    next_header = text.find("\n===", body_start)
+    body_end = len(text) if next_header == -1 else next_header
+    return text[:body_start], text[body_start:body_end], text[body_end:]
+
+
+def _find_text_token_span(
+    text: str,
+    target_text: Optional[str] = None,
+) -> Tuple[int, int, torch.Tensor]:
     """
     Find where `text` sits inside the full Qwen chat-formatted prompt,
     working in character space (robust to subword retokenisation artifacts).
@@ -477,16 +493,18 @@ def _find_text_token_span(text: str) -> Tuple[int, int, torch.Tensor]:
         messages, tokenize=False, add_generation_prompt=True
     ) + '{"vote": "'
 
-    # Locate the text inside the prompt string
-    char_start = prompt_str.find(text)
+    # Locate either the whole proposition or one editable section inside it.
+    target_text = text if target_text is None else target_text
+    proposition_start = prompt_str.find(text)
+    char_start = prompt_str.find(target_text, proposition_start)
     if char_start == -1:
-        char_start = prompt_str.find(text[:30].strip())
+        char_start = prompt_str.find(target_text[:30].strip(), proposition_start)
     if char_start == -1:
         raise ValueError(
             "Could not locate text inside the prompt string. "
             "Check that VOTER_PROFILE/SYSTEM_PROMPT don't contain the same substring."
         )
-    char_end = char_start + len(text)
+    char_end = char_start + len(target_text)
 
     enc = _qwen_tok(
         prompt_str, return_tensors="pt",
@@ -517,6 +535,7 @@ def whitebox_attack(
     ppl_factor:    float = 2.0,
     max_iters:     int   = 20,
     top_k:         int   = 20,   # top-k vocab candidates per token position
+    direction:     str   = "auto",
     return_history: bool = False,
 ):
     _init_reward_model()
@@ -532,8 +551,14 @@ def whitebox_attack(
     _, _, full_ids = reward(start_text, with_grad=True)
     MARKER = PROP_ANCHOR
 
-    # Flip to opposite of current vote
-    flip_to_yes = base_r < 0   # NO→YES if True, YES→NO if False
+    direction = direction.lower()
+    if direction not in {"yes", "no", "auto"}:
+        raise ValueError("direction must be 'yes', 'no', or 'auto'")
+
+    # In auto mode, preserve the old behavior: target the opposite vote.
+    flip_to_yes = base_r < 0 if direction == "auto" else direction == "yes"
+    editable_header = "SUPPORTERS" if flip_to_yes else "OPPONENTS"
+    frozen_before, _, frozen_after = _section_parts(start_text, editable_header)
 
     def _decode_with_swap(cur_full_ids: torch.Tensor, swap_pos: int,
                           swap_tok_id: int) -> Optional[str]:
@@ -555,6 +580,10 @@ def whitebox_attack(
         return text_portion.strip()
 
     print(f"\nOriginal  log-odds={base_r:+.3f} (YES if >0, NO if <0)  ppl={orig_ppl:.1f}")
+    print(
+        f"Target={'YES' if flip_to_yes else 'NO'}; "
+        f"editable section={editable_header}"
+    )
     print(start_text)
 
     current_text = start_text
@@ -564,7 +593,19 @@ def whitebox_attack(
     for step in range(max_iters):
         r, grad, cur_full_ids = reward(current_text, with_grad=True)
 
-        cur_start, cur_end, _ = _find_text_token_span(current_text)
+        current_before, editable_text, current_after = _section_parts(
+            current_text,
+            editable_header,
+        )
+        if current_before != frozen_before or current_after != frozen_after:
+            raise RuntimeError(
+                f"Text outside {editable_header} changed; aborting attack."
+            )
+
+        cur_start, cur_end, _ = _find_text_token_span(
+            current_text,
+            target_text=editable_text,
+        )
         text_ids = cur_full_ids[:, cur_start:cur_end]
         text_len = text_ids.shape[1]
 
@@ -599,6 +640,16 @@ def whitebox_attack(
             trial_text_raw = _decode_with_swap(cur_full_ids, abs_pos, tok_id)
             if trial_text_raw is None:
                 continue
+            try:
+                _, trial_editable_text, _ = _section_parts(
+                    trial_text_raw,
+                    editable_header,
+                )
+            except ValueError:
+                continue
+            # Preserve the exact original surroundings. Only the selected
+            # advocacy-section body is allowed into a candidate.
+            trial_text_raw = frozen_before + trial_editable_text + frozen_after
             if not re.search(r"(?<![a-zA-Z])" + re.escape(new_tok_str) + r"(?![a-zA-Z])",
                              trial_text_raw, re.IGNORECASE):
                 continue
@@ -854,6 +905,15 @@ def parse_args():
                    help="Max allowed perplexity increase factor (default: 2.0)")
     p.add_argument("--max_iters", type=int, default=20)
     p.add_argument("--top_k", type=int, default=50)
+    p.add_argument(
+        "--direction",
+        choices=["yes", "no", "auto"],
+        default="auto",
+        help=(
+            "Vote target and editable section: yes=SUPPORTERS, "
+            "no=OPPONENTS, auto=opposite of the current vote."
+        ),
+    )
     return p.parse_args()
 
 
@@ -914,6 +974,8 @@ def main():
             sim_threshold=args.sim_threshold,
             ppl_factor=args.ppl_factor,
             max_iters=args.max_iters,
+            top_k=args.top_k,
+            direction=args.direction,
             return_history=True,
         )
 

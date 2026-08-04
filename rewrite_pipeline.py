@@ -5,9 +5,9 @@ Pipeline:
     (original, adversarial rewrite) -> semantic-fidelity log-odds
     adversarial rewrite -> paraphrases -> vote-agreement robustness
 
-The attack implementation is intentionally left as a placeholder for the
-rewrite team. Until it is connected, pass a completed rewrite with
-``--adv_rewrite`` to run the similarity and robustness blocks.
+By default the attack block calls the section-restricted ``whitebox_attack``
+from ``rl.py``. Pass a completed rewrite with ``--adv_rewrite`` to skip the
+attack and run only the similarity and robustness blocks.
 """
 
 import argparse
@@ -27,14 +27,11 @@ def section_parts(text: str, header: str) -> tuple[str, str, str]:
     return text[:start], text[start:end], text[end:]
 
 
-def attack(original: str) -> str:
-    """Return an adversarial rewrite of ``original``.
-
-    Replace this body with the rewrite attack supplied by the attack team.
-    """
-    raise NotImplementedError(
-        "The attack block is not connected. Pass --adv_rewrite, or implement "
-        "attack(original) in rewrite_pipeline.py."
+def attack(original: str, direction: str = "auto") -> str:
+    """Run the section-restricted white-box attack from ``rl.py``."""
+    return rl.whitebox_attack(
+        original,
+        direction=direction,
     )
 
 
@@ -97,7 +94,6 @@ def robustness_check(
         "agreement_rate": (
             agreement_count / n_paraphrases if n_paraphrases else 1.0
         ),
-        "robust": agreement_count == n_paraphrases,
         "trials": trials,
     }
 
@@ -107,15 +103,30 @@ def evaluate_rewrite(
     adv_rewrite: Optional[str] = None,
     n_paraphrases: int = 100,
     temperature: float = 1.0,
+    direction: str = "auto",
     section_header: Optional[str] = None,
-    attack_fn: Callable[[str], str] = attack,
+    attack_fn: Callable[[str, str], str] = attack,
 ) -> Dict:
     """Run the attack, semantic-fidelity, and robustness blocks."""
+    direction = direction.lower()
+    if direction not in {"yes", "no", "auto"}:
+        raise ValueError("direction must be 'yes', 'no', or 'auto'")
+
+    original_vote_score = vote_score(original)
+    effective_direction = (
+        ("yes" if original_vote_score < 0 else "no")
+        if direction == "auto"
+        else direction
+    )
+    if section_header is None:
+        section_header = (
+            "SUPPORTERS" if effective_direction == "yes" else "OPPONENTS"
+        )
+
     if adv_rewrite is None:
-        adv_rewrite = attack_fn(original)
+        adv_rewrite = attack_fn(original, direction)
 
     similarity_score = rl.similarity_check(original, adv_rewrite)
-    original_vote_score = vote_score(original)
     robustness = robustness_check(
         adv_rewrite,
         n_paraphrases=n_paraphrases,
@@ -129,6 +140,9 @@ def evaluate_rewrite(
     return {
         "original": original,
         "adv_rewrite": adv_rewrite,
+        "requested_direction": direction,
+        "effective_direction": effective_direction,
+        "editable_section": section_header,
         "similarity_score": similarity_score,
         "original_vote": {
             "vote": original_vote,
@@ -161,6 +175,15 @@ def parse_args():
         help="Path to a precomputed adversarial rewrite. If omitted, attack() runs.",
     )
     parser.add_argument(
+        "--direction",
+        choices=["yes", "no", "auto"],
+        default="auto",
+        help=(
+            "Attack target: yes edits SUPPORTERS, no edits OPPONENTS, "
+            "auto targets the opposite of the original vote."
+        ),
+    )
+    parser.add_argument(
         "--voter_profile",
         default=None,
         help="Optional path to a prebuilt voter-profile text file.",
@@ -188,6 +211,7 @@ def main():
         adv_rewrite=adv_rewrite,
         n_paraphrases=args.n_paraphrases,
         temperature=args.temperature,
+        direction=args.direction,
     )
     Path(args.output).write_text(json.dumps(result, indent=2))
 
@@ -210,7 +234,6 @@ def main():
         f"{robustness['n_paraphrases']} "
         f"({robustness['agreement_rate']:.1%})"
     )
-    print(f"Robust: {robustness['robust']}")
     print(f"Saved: {args.output}")
 
 
